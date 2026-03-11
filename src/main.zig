@@ -24,7 +24,6 @@ fn printHelp() void {
         \\
         \\Options:
         \\  -b, --binary <path>   Target binary to execute (default: /bin/busybox)
-        \\  -t, --tools <items>  Comma-separated tools to copy (unused - busybox provides all)
         \\  -r, --root <path>    Container root directory (default: auto-generated)
         \\  -h, --help           Show this help message
         \\
@@ -67,14 +66,6 @@ fn parseArgs(allocator: std.mem.Allocator) !sandbox.Config {
             i += 1;
             allocator.free(config.binary);
             config.binary = try allocator.dupe(u8, args[i]);
-        } else if (std.mem.eql(u8, arg, "-t") or std.mem.eql(u8, arg, "--tools")) {
-            if (i + 1 >= args.len) {
-                std.debug.print("error: {s} requires an argument\n", .{arg});
-                std.process.exit(1);
-            }
-            i += 1;
-            allocator.free(config.tools);
-            config.tools = try allocator.dupe(u8, args[i]);
         } else if (std.mem.eql(u8, arg, "-r") or std.mem.eql(u8, arg, "--root")) {
             if (i + 1 >= args.len) {
                 std.debug.print("error: {s} requires an argument\n", .{arg});

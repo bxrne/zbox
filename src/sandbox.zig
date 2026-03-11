@@ -16,7 +16,6 @@ const clone_flags =
 pub const Config = struct {
     allocator: std.mem.Allocator,
     binary: []u8,
-    tools: []u8,
     root: ?[]u8 = null,
     args: []const []const u8 = &.{},
 
@@ -24,13 +23,11 @@ pub const Config = struct {
         return Config{
             .allocator = allocator,
             .binary = allocator.dupe(u8, "/bin/busybox") catch unreachable,
-            .tools = allocator.dupe(u8, "") catch unreachable,
         };
     }
 
     pub fn deinit(self: Config) void {
         self.allocator.free(self.binary);
-        self.allocator.free(self.tools);
         if (self.root) |r| {
             self.allocator.free(r);
         }
@@ -174,55 +171,42 @@ pub const Sandbox = struct {
         };
     }
 
-    fn fileExists(self: *Sandbox, path: []const u8) bool {
-        _ = self;
-        fs.accessAbsolute(path, .{}) catch return false;
-        return true;
-    }
-
     fn setupContainerFS(self: *Sandbox) !void {
         const root = self.root_path;
 
         log.info("setting up containerfs at {s}", .{root});
 
         try self.createDir(root);
-        try self.createDir(try self.concatPath(root, "/put_old"));
-        try self.createDir(try self.concatPath(root, "/proc"));
-        try self.createDir(try self.concatPath(root, "/dev"));
-        try self.createDir(try self.concatPath(root, "/tmp"));
-        try self.createDir(try self.concatPath(root, "/bin"));
 
-        const busybox_src = "/bin/busybox";
-        const busybox_dst = try self.concatPath(root, "/bin/busybox");
-        try fs.copyFileAbsolute(busybox_src, busybox_dst, .{});
+        const put_old = try self.concatPath(root, "/put_old");
+        defer self.allocator.free(put_old);
+        try self.createDir(put_old);
 
-        var it = std.mem.splitScalar(u8, self.config.tools, ',');
-        while (it.next()) |tool| {
-            const tool_name = std.mem.trim(u8, tool, " \t\r\n");
-            if (tool_name.len == 0) continue;
+        const proc_dir = try self.concatPath(root, "/proc");
+        defer self.allocator.free(proc_dir);
+        try self.createDir(proc_dir);
 
-            const link_path = try self.concatPath(try self.concatPath(root, "/bin/"), tool_name);
+        const dev_dir = try self.concatPath(root, "/dev");
+        defer self.allocator.free(dev_dir);
+        try self.createDir(dev_dir);
 
-            var tool_bin_path_buf: [64]u8 = undefined;
-            var tool_usr_bin_path_buf: [64]u8 = undefined;
+        const tmp_dir = try self.concatPath(root, "/tmp");
+        defer self.allocator.free(tmp_dir);
+        try self.createDir(tmp_dir);
 
-            const bin_path = std.fmt.bufPrint(&tool_bin_path_buf, "/bin/{s}", .{tool_name}) catch continue;
-            const usr_bin_path = std.fmt.bufPrint(&tool_usr_bin_path_buf, "/usr/bin/{s}", .{tool_name}) catch continue;
+        const bin_dir = try self.concatPath(root, "/bin");
+        defer self.allocator.free(bin_dir);
+        try self.createDir(bin_dir);
 
-            const target: []const u8 = if (self.fileExists(bin_path)) bin_path else if (self.fileExists(usr_bin_path)) usr_bin_path else {
-                log.warn("tool not found: {s}, skipping", .{tool_name});
-                self.allocator.free(link_path);
-                continue;
-            };
-
-            try createSymlink(target, link_path);
-            self.allocator.free(link_path);
-        }
+        const busybox_dst = try self.concatPath(bin_dir, "/busybox");
+        defer self.allocator.free(busybox_dst);
+        try fs.copyFileAbsolute("/bin/busybox", busybox_dst, .{});
 
         const configs = [_][]const u8{ "/etc/passwd", "/etc/group", "/etc/resolv.conf" };
         inline for (configs) |conf| {
             if (fs.accessAbsolute(conf, .{})) |_| {
                 const link_path = try self.concatPath(root, conf);
+                defer self.allocator.free(link_path);
                 createSymlink(conf, link_path) catch {};
             } else |_| {}
         }

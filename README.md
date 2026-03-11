@@ -47,7 +47,6 @@ zig build
 
 Options:
 - `-b, --binary <path>` - Binary to execute (default: /bin/busybox)
-- `-t, --tools <items>` - Tools to copy (unused - busybox provides all utilities)
 - `-r, --root <path>` - Container root directory
 - `-h, --help` - Show help
 
@@ -61,7 +60,7 @@ Options:
 - [x] Execute target binary
 - [x] Copy busybox into container
 - [x] Fresh filesystem per run
-- [ ] Interactive shell (stdin/stdout)
+- [x] Interactive shell (stdin/stdout)
 - [ ] Network namespace isolation
 - [ ] Syscall filtering (seccomp)
 - [ ] pivot_root (more secure than chroot)
