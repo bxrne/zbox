@@ -13,15 +13,47 @@ const clone_flags =
     linux.CLONE.NEWUTS |
     linux.SIG.CHLD;
 
+pub const Config = struct {
+    allocator: std.mem.Allocator,
+    binary: []u8,
+    tools: []u8,
+    root: ?[]u8 = null,
+    args: []const []const u8 = &.{},
+
+    pub fn init(allocator: std.mem.Allocator) Config {
+        return Config{
+            .allocator = allocator,
+            .binary = allocator.dupe(u8, "/bin/busybox") catch unreachable,
+            .tools = allocator.dupe(u8, "") catch unreachable,
+        };
+    }
+
+    pub fn deinit(self: Config) void {
+        self.allocator.free(self.binary);
+        self.allocator.free(self.tools);
+        if (self.root) |r| {
+            self.allocator.free(r);
+        }
+    }
+};
+
 pub const Sandbox = struct {
     allocator: std.mem.Allocator,
+    config: Config,
     stack: []u8,
     pipe: [2]posix.fd_t,
     pid: posix.pid_t,
+    root_path: []u8,
 
-    pub fn init(allocator: std.mem.Allocator) !Sandbox {
+    pub fn init(allocator: std.mem.Allocator, config: Config) !Sandbox {
+        const root_path = if (config.root) |r|
+            try allocator.dupe(u8, r)
+        else
+            try generateRootPath(allocator);
+
         return Sandbox{
             .allocator = allocator,
+            .config = config,
             .stack = try allocator.alignedAlloc(
                 u8,
                 std.mem.Alignment.fromByteUnits(16),
@@ -29,11 +61,14 @@ pub const Sandbox = struct {
             ),
             .pipe = try posix.pipe(),
             .pid = 0,
+            .root_path = root_path,
         };
     }
 
     pub fn deinit(self: *Sandbox) void {
         self.allocator.free(self.stack);
+        self.config.deinit();
+        self.allocator.free(self.root_path);
         posix.close(self.pipe[0]);
         posix.close(self.pipe[1]);
     }
@@ -66,12 +101,20 @@ pub const Sandbox = struct {
         try self.parentSetup();
         try self.signalChild();
     }
+
+    fn generateRootPath(allocator: std.mem.Allocator) ![]u8 {
+        const pid = linux.gettid();
+        const timestamp = std.time.milliTimestamp();
+        return std.fmt.allocPrint(allocator, "/tmp/zbox-{d}-{d}", .{ pid, timestamp });
+    }
+
     fn writeProcFile(path: []const u8, data: []const u8) !void {
         var file = try fs.openFileAbsolute(path, .{ .mode = .write_only });
         defer file.close();
 
         try file.writeAll(data);
     }
+
     fn setupUserNamespace(self: *Sandbox) !void {
         const uid = posix.getuid();
         const gid = linux.getgid();
@@ -114,15 +157,104 @@ pub const Sandbox = struct {
 
         try writeProcFile(gid_map, gid_map_data);
     }
+
+    fn createDir(_: *Sandbox, dir: []const u8) !void {
+        fs.makeDirAbsolute(dir) catch |err| {
+            if (err != error.PathAlreadyExists) return err;
+        };
+    }
+
+    fn concatPath(self: *Sandbox, a: []const u8, b: []const u8) ![]u8 {
+        return std.fmt.allocPrint(self.allocator, "{s}{s}", .{ a, b });
+    }
+
+    fn createSymlink(target: []const u8, link: []const u8) !void {
+        posix.symlink(target, link) catch |err| {
+            if (err != error.PathAlreadyExists) return err;
+        };
+    }
+
+    fn fileExists(self: *Sandbox, path: []const u8) bool {
+        _ = self;
+        fs.accessAbsolute(path, .{}) catch return false;
+        return true;
+    }
+
+    fn setupContainerFS(self: *Sandbox) !void {
+        const root = self.root_path;
+
+        log.info("setting up containerfs at {s}", .{root});
+
+        try self.createDir(root);
+        try self.createDir(try self.concatPath(root, "/put_old"));
+        try self.createDir(try self.concatPath(root, "/proc"));
+        try self.createDir(try self.concatPath(root, "/dev"));
+        try self.createDir(try self.concatPath(root, "/tmp"));
+        try self.createDir(try self.concatPath(root, "/bin"));
+
+        const busybox_src = "/bin/busybox";
+        const busybox_dst = try self.concatPath(root, "/bin/busybox");
+        try fs.copyFileAbsolute(busybox_src, busybox_dst, .{});
+
+        var it = std.mem.splitScalar(u8, self.config.tools, ',');
+        while (it.next()) |tool| {
+            const tool_name = std.mem.trim(u8, tool, " \t\r\n");
+            if (tool_name.len == 0) continue;
+
+            const link_path = try self.concatPath(try self.concatPath(root, "/bin/"), tool_name);
+
+            var tool_bin_path_buf: [64]u8 = undefined;
+            var tool_usr_bin_path_buf: [64]u8 = undefined;
+
+            const bin_path = std.fmt.bufPrint(&tool_bin_path_buf, "/bin/{s}", .{tool_name}) catch continue;
+            const usr_bin_path = std.fmt.bufPrint(&tool_usr_bin_path_buf, "/usr/bin/{s}", .{tool_name}) catch continue;
+
+            const target: []const u8 = if (self.fileExists(bin_path)) bin_path else if (self.fileExists(usr_bin_path)) usr_bin_path else {
+                log.warn("tool not found: {s}, skipping", .{tool_name});
+                self.allocator.free(link_path);
+                continue;
+            };
+
+            try createSymlink(target, link_path);
+            self.allocator.free(link_path);
+        }
+
+        const configs = [_][]const u8{ "/etc/passwd", "/etc/group", "/etc/resolv.conf" };
+        inline for (configs) |conf| {
+            if (fs.accessAbsolute(conf, .{})) |_| {
+                const link_path = try self.concatPath(root, conf);
+                createSymlink(conf, link_path) catch {};
+            } else |_| {}
+        }
+
+        log.info("containerfs setup complete", .{});
+    }
+
+    fn bindMount(_: *Sandbox, source: []const u8, target: []const u8) !void {
+        log.info("bind mounting {s} -> {s}", .{ source, target });
+
+        _ = linux.syscall5(.mount, @intFromPtr(source.ptr), @intFromPtr(target.ptr), @intFromPtr("".ptr), 4096, 0);
+    }
+
     fn parentSetup(self: *Sandbox) !void {
         log.info("parent performing namespace setup", .{});
 
         try self.setupUserNamespace();
+        try self.setupContainerFS();
 
-        // TODO: mount namespace configuration
-        // TODO: bind mounts
-        // TODO: pivot_root / chroot
+        const root = self.root_path;
+        const proc_path = try self.concatPath(root, "/proc");
+        const dev_path = try self.concatPath(root, "/dev");
+        const tmp_path = try self.concatPath(root, "/tmp");
+        defer self.allocator.free(proc_path);
+        defer self.allocator.free(dev_path);
+        defer self.allocator.free(tmp_path);
 
+        try self.bindMount(root, root);
+
+        try self.bindMount("/proc", proc_path);
+        try self.bindMount("/dev", dev_path);
+        try self.bindMount("/tmp", tmp_path);
     }
 
     fn signalChild(self: *Sandbox) !void {
@@ -143,6 +275,31 @@ pub const Sandbox = struct {
         } else if ((status & 0xffff) == 0xffff) {
             log.debug("child continued", .{});
         }
+
+        try self.cleanup();
+    }
+
+    fn cleanup(self: *Sandbox) !void {
+        const root = self.root_path;
+
+        const proc_path = try self.concatPath(root, "/proc");
+        const dev_path = try self.concatPath(root, "/dev");
+        const tmp_path = try self.concatPath(root, "/tmp");
+        defer self.allocator.free(proc_path);
+        defer self.allocator.free(dev_path);
+        defer self.allocator.free(tmp_path);
+
+        log.info("cleaning up bind mounts and container root", .{});
+
+        _ = linux.syscall2(.umount2, @intFromPtr(proc_path.ptr), 0);
+        _ = linux.syscall2(.umount2, @intFromPtr(dev_path.ptr), 0);
+        _ = linux.syscall2(.umount2, @intFromPtr(tmp_path.ptr), 0);
+
+        fs.deleteTreeAbsolute(root) catch |err| {
+            log.warn("failed to cleanup {s}: {}", .{ root, err });
+        };
+
+        log.info("cleanup complete", .{});
     }
 };
 
@@ -160,11 +317,24 @@ fn childEntry(arg: usize) callconv(.c) u8 {
 
     log.info("child starting sandbox workload", .{});
 
-    // TODO: exec target binary
-    // example:
-    // posix.execve(...)
+    const root = sandbox.root_path;
 
-    log.info("child exiting", .{});
+    posix.chdir(root) catch |err| {
+        log.err("chdir to {s} failed: {}", .{ root, err });
+        return 1;
+    };
 
-    return 0;
+    const errno_chroot = linux.syscall1(.chroot, @intFromPtr(root.ptr));
+    if (errno_chroot != 0) {
+        log.err("chroot failed", .{});
+        return 1;
+    }
+
+    log.info("chroot complete, executing {s}", .{sandbox.config.binary});
+
+    const binary_ptr: [*:0]const u8 = @ptrCast(sandbox.config.binary.ptr);
+    _ = linux.execve(binary_ptr, &.{ binary_ptr, "sh", null }, &.{null});
+
+    log.err("execve failed", .{});
+    return 1;
 }
