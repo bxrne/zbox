@@ -5,9 +5,12 @@ const linux = std.os.linux;
 const log = std.log;
 const fs = std.fs;
 
+const network = @import("network.zig");
+
 const STACK_SIZE = 64 * 1024;
 
 const clone_flags =
+    linux.CLONE.NEWNET |
     linux.CLONE.NEWUSER |
     linux.CLONE.NEWNS |
     linux.CLONE.NEWUTS |
@@ -315,6 +318,11 @@ fn childEntry(arg: usize) callconv(.c) u8 {
     }
 
     log.info("chroot complete, executing {s}", .{sandbox.config.binary});
+
+    network.bringUpLoopback() catch |err| {
+        log.err("failed to bring up loopback: {}", .{err});
+        return 1;
+    };
 
     const binary_ptr: [*:0]const u8 = @ptrCast(sandbox.config.binary.ptr);
     _ = linux.execve(binary_ptr, &.{ binary_ptr, "sh", null }, &.{null});

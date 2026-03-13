@@ -61,7 +61,7 @@ Options:
 - [x] Copy busybox into container
 - [x] Fresh filesystem per run
 - [x] Interactive shell (stdin/stdout)
-- [ ] Network namespace isolation
+- [x] Network namespace isolation
 - [ ] Syscall filtering (seccomp)
 - [ ] pivot_root (more secure than chroot)
 - [ ] OCI compatibility (run container images)
