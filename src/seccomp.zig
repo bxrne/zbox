@@ -43,6 +43,9 @@ const OFFSET_ARCH = 4; // offsetof(seccomp_data, arch)
 /// Syscalls the sandboxed process is allowed to make. Covers what
 /// busybox sh needs for basic interactive use (file ops, process
 /// management, memory, signals, terminal I/O).
+/// Note: This filter is x86_64-specific (hardcoded syscall numbers and
+/// architecture check). Other architectures require different syscall
+/// numbers and arch identifiers.
 const allowed_syscalls = [_]u32{
     // Process lifecycle.
     @intFromEnum(linux.SYS.execve),
@@ -65,6 +68,8 @@ const allowed_syscalls = [_]u32{
     @intFromEnum(linux.SYS.setsid),
     @intFromEnum(linux.SYS.gettid),
     @intFromEnum(linux.SYS.set_tid_address),
+    @intFromEnum(linux.SYS.getrlimit),
+    @intFromEnum(linux.SYS.setrlimit),
 
     // File I/O.
     @intFromEnum(linux.SYS.open),
@@ -120,6 +125,8 @@ const allowed_syscalls = [_]u32{
     @intFromEnum(linux.SYS.readv),
     @intFromEnum(linux.SYS.ppoll),
     @intFromEnum(linux.SYS.pselect6),
+    @intFromEnum(linux.SYS.poll),
+    @intFromEnum(linux.SYS.select),
 
     // Time and system info.
     @intFromEnum(linux.SYS.clock_gettime),

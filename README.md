@@ -14,7 +14,9 @@ Each run creates a fresh, isolated filesystem with its own user/mount/PID/UTS/ne
 
 ## Requirements
 
-- Linux kernel with namespace support
+- **x86_64 architecture** — seccomp filter is hardcoded for x86_64 syscall numbers
+- **Linux kernel with namespace support** (kernel 5.11+ recommended)
+- **Rootless namespaces** — user namespaces must be enabled (check with `sysctl kernel.unprivileged_userns_clone`)
 - A statically-linked shell binary (e.g. [busybox](https://busybox.net/)) for testing
 
 ### busybox
