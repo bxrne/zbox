@@ -4,5 +4,9 @@
   "binary": "/bin/busybox",
   "cpu_cores": 2,
   "cpu_limit_percent": 10,
-  "memory_limit_mb": 3
+  "memory_limit_mb": 3,
+  "network_access": true,
+  "port_forwards": [
+    { "host": 8080, "sandbox": 80 }
+  ]
 }

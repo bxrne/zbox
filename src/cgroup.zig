@@ -100,10 +100,6 @@ fn compute_cpu_quota(period: u64, cpu_cores: u32, cpu_limit_percent: u32) u64 {
     return period * @as(u64, cpu_cores) * @as(u64, cpu_limit_percent) / 100;
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
 test "compute_cpu_quota — single core full usage" {
     const quota = compute_cpu_quota(100_000, 1, 100);
     try std.testing.expectEqual(@as(u64, 100_000), quota);

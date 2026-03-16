@@ -2,6 +2,11 @@
 
 const std = @import("std");
 
+pub const PortForward = struct {
+    host: u16,
+    sandbox: u16,
+};
+
 pub const Config = struct {
     name: [:0]const u8,
     binary: [:0]const u8,
@@ -9,14 +14,22 @@ pub const Config = struct {
     cpu_cores: u32,
     cpu_limit_percent: u32,
     memory_limit_mb: u32,
+    port_forwards: []PortForward,
+    network_access: bool,
 
     /// Free all owned string fields and zero the struct.
     pub fn deinit(self: *Config, allocator: std.mem.Allocator) void {
         allocator.free(self.name);
         allocator.free(self.binary);
         allocator.free(self.root);
+        allocator.free(self.port_forwards);
         self.* = undefined;
     }
+};
+
+const JsonPortForward = struct {
+    host: u16,
+    sandbox: u16,
 };
 
 const JsonConfig = struct {
@@ -26,6 +39,8 @@ const JsonConfig = struct {
     cpu_cores: u32,
     cpu_limit_percent: u32,
     memory_limit_mb: u32,
+    port_forwards: ?[]const JsonPortForward = null,
+    network_access: ?bool = false,
 };
 
 /// Load and validate a Config from a JSON file at `path`.
@@ -59,6 +74,17 @@ pub fn load(allocator: std.mem.Allocator, path: []const u8) !Config {
     const root = try allocator.dupeZ(u8, cfg.root);
     errdefer allocator.free(root);
 
+    var port_forwards: []PortForward = &.{};
+    if (cfg.port_forwards) |pf_arr| {
+        port_forwards = try allocator.alloc(PortForward, pf_arr.len);
+        errdefer allocator.free(port_forwards);
+        for (pf_arr, 0..) |pf, i| {
+            port_forwards[i] = .{ .host = pf.host, .sandbox = pf.sandbox };
+        }
+    }
+
+    const network_access = cfg.network_access orelse false;
+
     return Config{
         .name = name,
         .binary = binary,
@@ -66,12 +92,10 @@ pub fn load(allocator: std.mem.Allocator, path: []const u8) !Config {
         .cpu_cores = cfg.cpu_cores,
         .cpu_limit_percent = cfg.cpu_limit_percent,
         .memory_limit_mb = cfg.memory_limit_mb,
+        .port_forwards = port_forwards,
+        .network_access = network_access,
     };
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 test "load — valid config file" {
     const allocator = std.testing.allocator;
@@ -83,7 +107,9 @@ test "load — valid config file" {
         \\  "binary": "/bin/busybox",
         \\  "cpu_cores": 2,
         \\  "cpu_limit_percent": 10,
-        \\  "memory_limit_mb": 3
+        \\  "memory_limit_mb": 3,
+        \\  "port_forwards": [{"host": 8080, "sandbox": 80}],
+        \\  "network_access": true
         \\}
     ;
 
@@ -104,6 +130,10 @@ test "load — valid config file" {
     try std.testing.expectEqual(@as(u32, 2), cfg.cpu_cores);
     try std.testing.expectEqual(@as(u32, 10), cfg.cpu_limit_percent);
     try std.testing.expectEqual(@as(u32, 3), cfg.memory_limit_mb);
+    try std.testing.expectEqual(@as(usize, 1), cfg.port_forwards.len);
+    try std.testing.expectEqual(@as(u16, 8080), cfg.port_forwards[0].host);
+    try std.testing.expectEqual(@as(u16, 80), cfg.port_forwards[0].sandbox);
+    try std.testing.expectEqual(true, cfg.network_access);
 }
 
 test "Config.deinit frees owned strings" {
@@ -116,6 +146,8 @@ test "Config.deinit frees owned strings" {
         .cpu_cores = 1,
         .cpu_limit_percent = 50,
         .memory_limit_mb = 64,
+        .port_forwards = &.{},
+        .network_access = true,
     };
 
     cfg.deinit(allocator);

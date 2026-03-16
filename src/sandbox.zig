@@ -53,6 +53,8 @@ pub const Sandbox = struct {
     pid: posix.pid_t,
     root_path: [:0]const u8,
     generated_root: bool,
+    veth_host: ?[:0]const u8,
+    veth_sandbox: ?[:0]const u8,
 
     pub fn init(allocator: std.mem.Allocator, args: args_mod.Args) !Sandbox {
         std.debug.assert(args.config.binary.len > 0 and args.config.binary[0] == '/');
@@ -77,6 +79,8 @@ pub const Sandbox = struct {
             .pid = 0,
             .root_path = root_path,
             .generated_root = false,
+            .veth_host = null,
+            .veth_sandbox = null,
         };
 
         // Postconditions on the freshly-built sandbox.
@@ -93,6 +97,8 @@ pub const Sandbox = struct {
         posix.close(self.pipe[1]);
         self.allocator.free(self.stack);
         self.allocator.free(self.root_path);
+        if (self.veth_host) |v| self.allocator.free(v);
+        if (self.veth_sandbox) |v| self.allocator.free(v);
         self.args.deinit(self.allocator);
     }
 
@@ -156,6 +162,31 @@ pub const Sandbox = struct {
         cgroup.add_process(self.args.config.name, self.pid) catch |err| {
             log.warn("cgroup add_process failed: {}", .{err});
         };
+
+        if (self.args.config.network_access or self.args.config.port_forwards.len > 0) {
+            try self.setup_network();
+        }
+    }
+
+    fn setup_network(self: *Sandbox) !void {
+        log.info("setting up network with veth pair", .{});
+
+        const veth = try network.create_veth_pair(self.allocator, self.args.config.name);
+        self.veth_host = veth.host;
+        self.veth_sandbox = veth.sandbox;
+
+        try network.move_veth_to_ns(veth.sandbox, self.pid);
+        try network.configure_host_veth(veth.host);
+
+        for (self.args.config.port_forwards) |pf| {
+            try network.setup_port_forward(pf.host, pf.sandbox);
+        }
+
+        if (self.args.config.network_access) {
+            try network.setup_masquerade();
+        }
+
+        log.info("network setup complete", .{});
     }
 
     fn setup_user_namespace(self: *Sandbox) !void {
@@ -242,7 +273,14 @@ pub const Sandbox = struct {
         _ = linux.syscall2(.umount2, @intFromPtr(fs.join_path(&buf_dev, self.root_path, "/dev").ptr), 0);
         _ = linux.syscall2(.umount2, @intFromPtr(fs.join_path(&buf_tmp, self.root_path, "/tmp").ptr), 0);
 
-        // Only remove the root if we generated it.
+        for (self.args.config.port_forwards) |pf| {
+            network.cleanup_port_forward(pf.host, pf.sandbox);
+        }
+
+        if (self.veth_host) |v| {
+            network.delete_veth_pair(v);
+        }
+
         if (self.generated_root) {
             std.fs.deleteTreeAbsolute(self.root_path) catch |err| {
                 log.warn("failed to cleanup {s}: {}", .{ self.root_path, err });
@@ -334,6 +372,15 @@ fn child_entry(arg: usize) callconv(.c) u8 {
         log.err("loopback failed: {}", .{err});
         return 1;
     };
+
+    if (sandbox_ptr.args.config.network_access or sandbox_ptr.args.config.port_forwards.len > 0) {
+        var veth_name_buf: [64]u8 = undefined;
+        const veth_name = std.fmt.bufPrintZ(&veth_name_buf, "zbxs{s}", .{sandbox_ptr.args.config.name}) catch unreachable;
+        network.configure_sandbox_veth(veth_name) catch |err| {
+            log.err("sandbox veth config failed: {}", .{err});
+            return 1;
+        };
+    }
 
     // Install seccomp filter last — after all privileged setup is done
     // but before execve hands control to untrusted code.

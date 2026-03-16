@@ -22,6 +22,13 @@ Each run creates a fresh, isolated filesystem with its own user/mount/PID/UTS/ne
 - **Rootless namespaces** — user namespaces must be enabled (check with `sysctl kernel.unprivileged_userns_clone`)
 - A statically-linked shell binary (e.g. [busybox](https://busybox.net/)) for testing
 
+### Network Features (Optional)
+
+For `network_access` and `port_forwards`:
+- `ip` command (from iproute2 package)
+- `iptables`
+- Root or `CAP_NET_ADMIN` capability
+
 ## Security
 
 ### Syscall Filtering
@@ -94,6 +101,15 @@ Configure via JSON file passed with `-c/--cfg`:
 | `cpu_cores` | u32 | Number of CPU cores to allow |
 | `cpu_limit_percent` | u32 | CPU limit as percentage (1-100) |
 | `memory_limit_mb` | u32 | Memory limit in megabytes |
+| `network_access` | bool | Enable internet access from sandbox (default: false) |
+| `port_forwards` | array | Port mappings for accessing services inside sandbox |
+
+### Port Forwards
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `host` | u16 | Port on host to listen on |
+| `sandbox` | u16 | Port inside sandbox to forward to |
 
 Example:
 
@@ -104,19 +120,42 @@ Example:
   "binary": "/bin/busybox",
   "cpu_cores": 2,
   "cpu_limit_percent": 10,
-  "memory_limit_mb": 3
+  "memory_limit_mb": 3,
+  "network_access": true,
+  "port_forwards": [
+    { "host": 8080, "sandbox": 80 },
+    { "host": 2222, "sandbox": 22 }
+  ]
 }
 ```
 
+### Network Access
+
+When `network_access: true` is set:
+- A veth pair is created connecting the sandbox to the host
+- Sandbox gets IP `10.0.2.2/24`
+- Host gets IP `10.0.2.1/24`
+- NAT/masquerading is enabled allowing the sandbox to access the internet
+- Port forwards allow services inside the sandbox to be accessed from the host
+
+**Requirements for network features:**
+- `ip` command (iproute2 package)
+- `iptables` 
+- Root or `CAP_NET_ADMIN` capability for network operations
+
 ## Resource Limits (cgroups)
 
-zbox uses Linux cgroups v2 for CPU and memory limits. This **requires sudo** because cgroup files in `/sys/fs/cgroup/` are typically root-only:
+zbox uses Linux cgroups v2 for CPU and memory limits. **This requires sudo** because cgroup files in `/sys/fs/cgroup/` are root-only:
 
 ```bash
 sudo ./zig-out/bin/zbox -c config.json
 ```
 
-Without sudo, the sandbox runs but resource limits are skipped (warnings are logged).
+### Rootless Mode
+
+Without sudo, the sandbox runs but **resource limits are not applied**. The kernel does not allow unprivileged users to create or manage cgroups. This is a fundamental Linux limitation - all container tools (Docker, Podman, etc.) require root for resource limits.
+
+The sandbox still provides full isolation via namespaces (user, mount, PID, UTS, network), but CPU/memory constraints require privileged access.
 
 ## Roadmap
 
@@ -132,6 +171,8 @@ Without sudo, the sandbox runs but resource limits are skipped (warnings are log
 - [x] Interactive shell (stdin/stdout)
 - [x] Network namespace isolation
 - [x] Syscall filtering (seccomp-BPF deny list)
-- [x] Resource limits (CPU, Memory via cgroups)
+- [x] Resource limits (CPU, Memory via cgroups, requires sudo)
+- [x] Network access (NAT/masquerading)
+- [x] Port forwarding (veth + iptables)
 - [ ] pivot_root (more secure than chroot)
 - [ ] OCI compatibility (run container images)

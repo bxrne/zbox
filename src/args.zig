@@ -96,10 +96,6 @@ pub fn parse(allocator: std.mem.Allocator) !Args {
     };
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
 test "Args.deinit frees child args" {
     const allocator = std.testing.allocator;
 
@@ -111,6 +107,8 @@ test "Args.deinit frees child args" {
             .cpu_cores = 1,
             .cpu_limit_percent = 50,
             .memory_limit_mb = 64,
+            .port_forwards = &.{},
+            .network_access = false,
         },
     };
     a.child_args[0] = try allocator.dupeZ(u8, "ls");
