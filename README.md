@@ -1,5 +1,8 @@
 # zbox
 
+[![CI](https://github.com/bxrne/zbox/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/bxrne/zbox/actions/workflows/ci.yml) [![Release](https://github.com/bxrne/zbox/actions/workflows/release.yml/badge.svg?branch=master)](https://github.com/bxrne/zbox/actions/workflows/release.yml)
+
+
 Minimal rootless Linux sandbox written in [Zig](https://ziglang.org/).
 
 Use cases: build environments, agentic AI sessions, foundation for container runtimes.
