@@ -73,11 +73,47 @@ zig build test
 ./zig-out/bin/zbox
 ```
 
-Options:
-- `-b, --binary <path>` — binary to execute inside the sandbox (default: `/bin/busybox`)
-- `-r, --root <path>` — container root directory (default: auto-generated under `/tmp`)
-- `-h, --help` — show help
-- `--` — forward remaining arguments to the sandboxed binary
+## Options
+
+- `-c, --cfg <path>` — Path to JSON config file (default: config.json)
+- `-h, --help` — Show help
+- `--` — Forward remaining arguments to the sandboxed binary
+
+## Configuration
+
+Configure via JSON file passed with `-c/--cfg`:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `name` | string | Sandbox identifier (used for cgroup name) |
+| `binary` | string | Absolute path to executable inside sandbox |
+| `root` | string | Absolute path to sandbox root directory |
+| `cpu_cores` | u32 | Number of CPU cores to allow |
+| `cpu_limit_percent` | u32 | CPU limit as percentage (1-100) |
+| `memory_limit_mb` | u32 | Memory limit in megabytes |
+
+Example:
+
+```json
+{
+  "name": "zbox-sandbox",
+  "root": "/tmp/zbox_root",
+  "binary": "/bin/busybox",
+  "cpu_cores": 2,
+  "cpu_limit_percent": 10,
+  "memory_limit_mb": 3
+}
+```
+
+## Resource Limits (cgroups)
+
+zbox uses Linux cgroups v2 for CPU and memory limits. This **requires sudo** because cgroup files in `/sys/fs/cgroup/` are typically root-only:
+
+```bash
+sudo ./zig-out/bin/zbox -c config.json
+```
+
+Without sudo, the sandbox runs but resource limits are skipped (warnings are logged).
 
 ## Roadmap
 
@@ -93,5 +129,6 @@ Options:
 - [x] Interactive shell (stdin/stdout)
 - [x] Network namespace isolation
 - [x] Syscall filtering (seccomp-BPF deny list)
+- [x] Resource limits (CPU, Memory via cgroups)
 - [ ] pivot_root (more secure than chroot)
 - [ ] OCI compatibility (run container images)

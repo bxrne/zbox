@@ -4,7 +4,8 @@ const posix = std.posix;
 const linux = std.os.linux;
 const log = std.log;
 
-const config = @import("config.zig");
+const args_mod = @import("args.zig");
+const cgroup = @import("cgroup.zig");
 const network = @import("network.zig");
 const seccomp = @import("seccomp.zig");
 const fs = @import("fs.zig");
@@ -46,22 +47,17 @@ pub fn decode_wait_status(status: u32) WaitResult {
 
 pub const Sandbox = struct {
     allocator: std.mem.Allocator,
-    cfg: config.Config,
+    args: args_mod.Args,
     stack: []align(16) u8,
     pipe: [2]posix.fd_t,
     pid: posix.pid_t,
     root_path: [:0]const u8,
     generated_root: bool,
 
-    pub fn init(allocator: std.mem.Allocator, cfg: config.Config) !Sandbox {
-        std.debug.assert(cfg.binary.len > 0 and cfg.binary[0] == '/');
+    pub fn init(allocator: std.mem.Allocator, args: args_mod.Args) !Sandbox {
+        std.debug.assert(args.config.binary.len > 0 and args.config.binary[0] == '/');
 
-        const generated = cfg.root == null;
-
-        const root_path: [:0]const u8 = if (cfg.root) |r|
-            try allocator.dupeZ(u8, r)
-        else
-            try fs.generate_root_path(allocator);
+        const root_path: [:0]const u8 = try allocator.dupeZ(u8, args.config.root);
         errdefer allocator.free(root_path);
 
         const stack = try allocator.alignedAlloc(
@@ -75,12 +71,12 @@ pub const Sandbox = struct {
 
         const self = Sandbox{
             .allocator = allocator,
-            .cfg = cfg,
+            .args = args,
             .stack = stack,
             .pipe = pipe,
             .pid = 0,
             .root_path = root_path,
-            .generated_root = generated,
+            .generated_root = false,
         };
 
         // Postconditions on the freshly-built sandbox.
@@ -97,7 +93,7 @@ pub const Sandbox = struct {
         posix.close(self.pipe[1]);
         self.allocator.free(self.stack);
         self.allocator.free(self.root_path);
-        self.cfg.deinit(self.allocator);
+        self.args.deinit(self.allocator);
     }
 
     /// Clone a child into isolated namespaces, perform parent-side setup,
@@ -147,6 +143,19 @@ pub const Sandbox = struct {
 
         try self.setup_user_namespace();
         try self.setup_container_fs();
+
+        cgroup.create(
+            self.args.config.name,
+            self.args.config.cpu_cores,
+            self.args.config.cpu_limit_percent,
+            self.args.config.memory_limit_mb,
+        ) catch |err| {
+            log.warn("cgroup setup failed: {}", .{err});
+            return;
+        };
+        cgroup.add_process(self.args.config.name, self.pid) catch |err| {
+            log.warn("cgroup add_process failed: {}", .{err});
+        };
     }
 
     fn setup_user_namespace(self: *Sandbox) !void {
@@ -203,14 +212,14 @@ pub const Sandbox = struct {
         try fs.create_dir(fs.join_path(&buf, root, "/etc"));
 
         // Copy the configured binary into the container.
-        const basename = fs.extract_basename(self.cfg.binary);
+        const basename = fs.extract_basename(self.args.config.binary);
         var dst_buf: [4096]u8 = undefined;
         const bin_dst = std.fmt.bufPrintZ(
             &dst_buf,
             "{s}/bin/{s}",
             .{ root, basename },
         ) catch unreachable;
-        try std.fs.copyFileAbsolute(self.cfg.binary, bin_dst, .{});
+        try std.fs.copyFileAbsolute(self.args.config.binary, bin_dst, .{});
 
         copy_host_configs(root);
         log.info("containerfs setup complete", .{});
@@ -227,6 +236,7 @@ pub const Sandbox = struct {
         var buf_dev: [4096]u8 = undefined;
         var buf_tmp: [4096]u8 = undefined;
 
+        cgroup.destroy(self.args.config.name);
         log.info("cleaning up bind mounts and container root", .{});
         _ = linux.syscall2(.umount2, @intFromPtr(fs.join_path(&buf_proc, self.root_path, "/proc").ptr), 0);
         _ = linux.syscall2(.umount2, @intFromPtr(fs.join_path(&buf_dev, self.root_path, "/dev").ptr), 0);
@@ -289,10 +299,10 @@ fn copy_host_configs(root: [:0]const u8) void {
 
 fn child_entry(arg: usize) callconv(.c) u8 {
     std.debug.assert(arg != 0);
-    const sandbox: *Sandbox = @ptrFromInt(arg);
+    const sandbox_ptr: *Sandbox = @ptrFromInt(arg);
 
     var buf: [1]u8 = undefined;
-    const n = posix.read(sandbox.pipe[0], &buf) catch |err| {
+    const n = posix.read(sandbox_ptr.pipe[0], &buf) catch |err| {
         log.err("child pipe read failed: {}", .{err});
         return 1;
     };
@@ -304,17 +314,17 @@ fn child_entry(arg: usize) callconv(.c) u8 {
 
     // Bind mounts must happen inside the child because CLONE_NEWNS
     // gave *this* process the new mount namespace, not the parent.
-    child_bind_mounts(sandbox.root_path) catch |err| {
+    child_bind_mounts(sandbox_ptr.root_path) catch |err| {
         log.err("bind mounts failed: {}", .{err});
         return 1;
     };
 
-    posix.chdir(sandbox.root_path) catch |err| {
+    posix.chdir(sandbox_ptr.root_path) catch |err| {
         log.err("chdir failed: {}", .{err});
         return 1;
     };
 
-    const rc = linux.syscall1(.chroot, @intFromPtr(sandbox.root_path.ptr));
+    const rc = linux.syscall1(.chroot, @intFromPtr(sandbox_ptr.root_path.ptr));
     if (rc != 0) {
         log.err("chroot failed", .{});
         return 1;
@@ -332,13 +342,13 @@ fn child_entry(arg: usize) callconv(.c) u8 {
         return 1;
     };
 
-    return do_execve(sandbox);
+    return do_execve(sandbox_ptr);
 }
 
-/// Build argv from config and call execve. Factored out to keep
+/// Build argv from args and call execve. Factored out to keep
 /// child_entry under 70 lines.
-fn do_execve(sandbox: *Sandbox) u8 {
-    const basename = fs.extract_basename(sandbox.cfg.binary);
+fn do_execve(sandbox_ptr: *Sandbox) u8 {
+    const basename = fs.extract_basename(sandbox_ptr.args.config.binary);
     var bin_buf: [4096]u8 = undefined;
     const bin_path = std.fmt.bufPrintZ(
         &bin_buf,
@@ -347,14 +357,14 @@ fn do_execve(sandbox: *Sandbox) u8 {
     ) catch unreachable;
     const bin_ptr: [*:0]const u8 = bin_path.ptr;
 
-    if (sandbox.cfg.args_count > 0) {
-        var argv: [config.args_max + 2]?[*:0]const u8 = undefined;
+    if (sandbox_ptr.args.child_args_count > 0) {
+        var argv: [args_mod.args_max + 2]?[*:0]const u8 = undefined;
         argv[0] = bin_ptr;
         var i: u32 = 0;
-        while (i < sandbox.cfg.args_count) : (i += 1) {
-            argv[i + 1] = sandbox.cfg.args[i].ptr;
+        while (i < sandbox_ptr.args.child_args_count) : (i += 1) {
+            argv[i + 1] = sandbox_ptr.args.child_args[i].ptr;
         }
-        argv[sandbox.cfg.args_count + 1] = null;
+        argv[sandbox_ptr.args.child_args_count + 1] = null;
         _ = linux.execve(bin_ptr, @ptrCast(&argv), &.{null});
     } else {
         _ = linux.execve(bin_ptr, &.{ bin_ptr, "sh", null }, &.{null});

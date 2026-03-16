@@ -1,74 +1,199 @@
-//! Sandbox configuration.
+//! JSON configuration file parsing for zbox sandboxes.
+
 const std = @import("std");
 
-pub const default_binary: [:0]const u8 = "/bin/busybox";
-pub const args_max: u32 = 32;
-
 pub const Config = struct {
-    binary: [:0]const u8 = default_binary,
-    root: ?[]const u8 = null,
-    args: [args_max][:0]const u8 = undefined,
-    args_count: u32 = 0,
-    owns_binary: bool = false,
-    owns_root: bool = false,
+    name: [:0]const u8,
+    binary: [:0]const u8,
+    root: [:0]const u8,
+    cpu_cores: u32,
+    cpu_limit_percent: u32,
+    memory_limit_mb: u32,
 
-    pub fn init() Config {
-        return .{};
-    }
-
-    /// Free any heap-owned strings. Must pass the same allocator used to
-    /// duplicate them.
+    /// Free all owned string fields and zero the struct.
     pub fn deinit(self: *Config, allocator: std.mem.Allocator) void {
-        var i: u32 = 0;
-        while (i < self.args_count) : (i += 1) {
-            allocator.free(self.args[i]);
-        }
-
-        if (self.owns_binary) {
-            allocator.free(self.binary);
-        }
-
-        if (self.owns_root) {
-            if (self.root) |r| allocator.free(r);
-        }
-
-        self.* = .{};
+        allocator.free(self.name);
+        allocator.free(self.binary);
+        allocator.free(self.root);
+        self.* = undefined;
     }
 };
 
-test "Config.init returns defaults" {
-    const cfg = Config.init();
+const JsonConfig = struct {
+    name: []const u8,
+    binary: []const u8,
+    root: []const u8,
+    cpu_cores: u32,
+    cpu_limit_percent: u32,
+    memory_limit_mb: u32,
+};
+
+/// Load and validate a Config from a JSON file at `path`.
+///
+/// All fields are required — missing fields cause a parse error.
+/// String fields are duped into owned memory via `allocator`.
+pub fn load(allocator: std.mem.Allocator, path: []const u8) !Config {
+    const data = try std.fs.cwd().readFileAlloc(allocator, path, 1 << 20);
+    defer allocator.free(data);
+
+    const parsed = try std.json.parseFromSlice(JsonConfig, allocator, data, .{
+        .ignore_unknown_fields = true,
+    });
+    defer parsed.deinit();
+    const cfg = parsed.value;
+
+    // Validate all fields before allocating owned copies.
+    if (cfg.name.len == 0) return error.InvalidConfig;
+    if (cfg.binary.len == 0 or cfg.binary[0] != '/') return error.InvalidConfig;
+    if (cfg.root.len == 0 or cfg.root[0] != '/') return error.InvalidConfig;
+    if (cfg.cpu_cores == 0) return error.InvalidConfig;
+    if (cfg.cpu_limit_percent == 0 or cfg.cpu_limit_percent > 100) return error.InvalidConfig;
+    if (cfg.memory_limit_mb == 0) return error.InvalidConfig;
+
+    const name = try allocator.dupeZ(u8, cfg.name);
+    errdefer allocator.free(name);
+
+    const binary = try allocator.dupeZ(u8, cfg.binary);
+    errdefer allocator.free(binary);
+
+    const root = try allocator.dupeZ(u8, cfg.root);
+    errdefer allocator.free(root);
+
+    return Config{
+        .name = name,
+        .binary = binary,
+        .root = root,
+        .cpu_cores = cfg.cpu_cores,
+        .cpu_limit_percent = cfg.cpu_limit_percent,
+        .memory_limit_mb = cfg.memory_limit_mb,
+    };
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+test "load — valid config file" {
+    const allocator = std.testing.allocator;
+
+    const json =
+        \\{
+        \\  "name": "test-sandbox",
+        \\  "root": "/tmp/zbox_root",
+        \\  "binary": "/bin/busybox",
+        \\  "cpu_cores": 2,
+        \\  "cpu_limit_percent": 10,
+        \\  "memory_limit_mb": 3
+        \\}
+    ;
+
+    const tmp_path = "zig-test-config.json";
+    {
+        var f = try std.fs.cwd().createFile(tmp_path, .{});
+        defer f.close();
+        try f.writeAll(json);
+    }
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+
+    var cfg = try load(allocator, tmp_path);
+    defer cfg.deinit(allocator);
+
+    try std.testing.expectEqualStrings("test-sandbox", cfg.name);
     try std.testing.expectEqualStrings("/bin/busybox", cfg.binary);
-    try std.testing.expect(cfg.root == null);
-    try std.testing.expectEqual(@as(u32, 0), cfg.args_count);
-    try std.testing.expect(!cfg.owns_binary);
-    try std.testing.expect(!cfg.owns_root);
+    try std.testing.expectEqualStrings("/tmp/zbox_root", cfg.root);
+    try std.testing.expectEqual(@as(u32, 2), cfg.cpu_cores);
+    try std.testing.expectEqual(@as(u32, 10), cfg.cpu_limit_percent);
+    try std.testing.expectEqual(@as(u32, 3), cfg.memory_limit_mb);
 }
 
-test "Config.deinit frees owned binary" {
+test "Config.deinit frees owned strings" {
     const allocator = std.testing.allocator;
-    var cfg = Config.init();
-    cfg.binary = try allocator.dupeZ(u8, "/usr/bin/test");
-    cfg.owns_binary = true;
+
+    var cfg = Config{
+        .name = try allocator.dupeZ(u8, "my-sandbox"),
+        .binary = try allocator.dupeZ(u8, "/bin/sh"),
+        .root = try allocator.dupeZ(u8, "/tmp/root"),
+        .cpu_cores = 1,
+        .cpu_limit_percent = 50,
+        .memory_limit_mb = 64,
+    };
+
     cfg.deinit(allocator);
-    try std.testing.expectEqualStrings("/bin/busybox", cfg.binary);
+    // std.testing.allocator detects leaks — if deinit missed a free the
+    // test runner would report it as a failure.
 }
 
-test "Config.deinit frees owned root" {
+test "load — rejects empty name" {
     const allocator = std.testing.allocator;
-    var cfg = Config.init();
-    cfg.root = try allocator.dupe(u8, "/tmp/test-root");
-    cfg.owns_root = true;
-    cfg.deinit(allocator);
-    try std.testing.expect(cfg.root == null);
+
+    const json =
+        \\{
+        \\  "name": "",
+        \\  "root": "/tmp/root",
+        \\  "binary": "/bin/sh",
+        \\  "cpu_cores": 1,
+        \\  "cpu_limit_percent": 50,
+        \\  "memory_limit_mb": 64
+        \\}
+    ;
+
+    const tmp_path = "zig-test-config-empty-name.json";
+    {
+        var f = try std.fs.cwd().createFile(tmp_path, .{});
+        defer f.close();
+        try f.writeAll(json);
+    }
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+
+    try std.testing.expectError(error.InvalidConfig, load(allocator, tmp_path));
 }
 
-test "Config.deinit frees args" {
+test "load — rejects non-absolute binary" {
     const allocator = std.testing.allocator;
-    var cfg = Config.init();
-    cfg.args[0] = try allocator.dupeZ(u8, "ls");
-    cfg.args[1] = try allocator.dupeZ(u8, "-la");
-    cfg.args_count = 2;
-    cfg.deinit(allocator);
-    try std.testing.expectEqual(@as(u32, 0), cfg.args_count);
+
+    const json =
+        \\{
+        \\  "name": "sandbox",
+        \\  "root": "/tmp/root",
+        \\  "binary": "busybox",
+        \\  "cpu_cores": 1,
+        \\  "cpu_limit_percent": 50,
+        \\  "memory_limit_mb": 64
+        \\}
+    ;
+
+    const tmp_path = "zig-test-config-rel-binary.json";
+    {
+        var f = try std.fs.cwd().createFile(tmp_path, .{});
+        defer f.close();
+        try f.writeAll(json);
+    }
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+
+    try std.testing.expectError(error.InvalidConfig, load(allocator, tmp_path));
+}
+
+test "load — rejects zero cpu_limit_percent" {
+    const allocator = std.testing.allocator;
+
+    const json =
+        \\{
+        \\  "name": "sandbox",
+        \\  "root": "/tmp/root",
+        \\  "binary": "/bin/sh",
+        \\  "cpu_cores": 1,
+        \\  "cpu_limit_percent": 0,
+        \\  "memory_limit_mb": 64
+        \\}
+    ;
+
+    const tmp_path = "zig-test-config-zero-cpu.json";
+    {
+        var f = try std.fs.cwd().createFile(tmp_path, .{});
+        defer f.close();
+        try f.writeAll(json);
+    }
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+
+    try std.testing.expectError(error.InvalidConfig, load(allocator, tmp_path));
 }
