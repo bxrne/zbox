@@ -1,6 +1,8 @@
 //! JSON configuration file parsing for zbox sandboxes.
 
 const std = @import("std");
+const posix = std.posix;
+const linux = std.os.linux;
 
 pub const PortForward = struct {
     host: u16,
@@ -27,11 +29,6 @@ pub const Config = struct {
     }
 };
 
-const JsonPortForward = struct {
-    host: u16,
-    sandbox: u16,
-};
-
 const JsonConfig = struct {
     name: []const u8,
     binary: []const u8,
@@ -39,7 +36,7 @@ const JsonConfig = struct {
     cpu_cores: u32,
     cpu_limit_percent: u32,
     memory_limit_mb: u32,
-    port_forwards: ?[]const JsonPortForward = null,
+    port_forwards: ?[]const PortForward = null,
     network_access: ?bool = false,
 };
 
@@ -48,8 +45,22 @@ const JsonConfig = struct {
 /// All fields are required — missing fields cause a parse error.
 /// String fields are duped into owned memory via `allocator`.
 pub fn load(allocator: std.mem.Allocator, path: []const u8) !Config {
-    const data = try std.fs.cwd().readFileAlloc(allocator, path, 1 << 20);
+    const fd = try posix.openat(posix.AT.FDCWD, path, .{}, 0);
+    defer _ = linux.close(fd);
+
+    var statx_buf: linux.Statx = undefined;
+    const stat_rc: isize = @bitCast(linux.statx(fd, "", linux.AT.EMPTY_PATH, linux.STATX{ .SIZE = true }, &statx_buf));
+    if (stat_rc < 0) return error.InvalidConfig;
+    const file_size: usize = @intCast(statx_buf.size);
+
+    const data = try allocator.alloc(u8, file_size);
     defer allocator.free(data);
+    var total_read: usize = 0;
+    while (total_read < file_size) {
+        const n = posix.read(fd, data[total_read..]) catch return error.InvalidConfig;
+        if (n == 0) break;
+        total_read += n;
+    }
 
     const parsed = try std.json.parseFromSlice(JsonConfig, allocator, data, .{
         .ignore_unknown_fields = true,
@@ -97,6 +108,24 @@ pub fn load(allocator: std.mem.Allocator, path: []const u8) !Config {
     };
 }
 
+fn writeTestFile(path: [*:0]const u8, content: []const u8) !void {
+    const rc: isize = @bitCast(linux.open(path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644));
+    if (rc < 0) return error.TestFileCreateFailed;
+    const fd: i32 = @intCast(rc);
+    defer _ = linux.close(fd);
+    var written: usize = 0;
+    while (written < content.len) {
+        const w = linux.write(fd, content[written..].ptr, content.len - written);
+        const w_signed: isize = @bitCast(w);
+        if (w_signed < 0) return error.TestFileCreateFailed;
+        written += @intCast(w_signed);
+    }
+}
+
+fn deleteTestFile(path: [*:0]const u8) void {
+    _ = linux.unlink(path);
+}
+
 test "load — valid config file" {
     const allocator = std.testing.allocator;
 
@@ -114,12 +143,8 @@ test "load — valid config file" {
     ;
 
     const tmp_path = "zig-test-config.json";
-    {
-        var f = try std.fs.cwd().createFile(tmp_path, .{});
-        defer f.close();
-        try f.writeAll(json);
-    }
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    try writeTestFile(tmp_path, json);
+    defer deleteTestFile(tmp_path);
 
     var cfg = try load(allocator, tmp_path);
     defer cfg.deinit(allocator);
@@ -170,12 +195,8 @@ test "load — rejects empty name" {
     ;
 
     const tmp_path = "zig-test-config-empty-name.json";
-    {
-        var f = try std.fs.cwd().createFile(tmp_path, .{});
-        defer f.close();
-        try f.writeAll(json);
-    }
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    try writeTestFile(tmp_path, json);
+    defer deleteTestFile(tmp_path);
 
     try std.testing.expectError(error.InvalidConfig, load(allocator, tmp_path));
 }
@@ -195,12 +216,8 @@ test "load — rejects non-absolute binary" {
     ;
 
     const tmp_path = "zig-test-config-rel-binary.json";
-    {
-        var f = try std.fs.cwd().createFile(tmp_path, .{});
-        defer f.close();
-        try f.writeAll(json);
-    }
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    try writeTestFile(tmp_path, json);
+    defer deleteTestFile(tmp_path);
 
     try std.testing.expectError(error.InvalidConfig, load(allocator, tmp_path));
 }
@@ -220,12 +237,8 @@ test "load — rejects zero cpu_limit_percent" {
     ;
 
     const tmp_path = "zig-test-config-zero-cpu.json";
-    {
-        var f = try std.fs.cwd().createFile(tmp_path, .{});
-        defer f.close();
-        try f.writeAll(json);
-    }
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    try writeTestFile(tmp_path, json);
+    defer deleteTestFile(tmp_path);
 
     try std.testing.expectError(error.InvalidConfig, load(allocator, tmp_path));
 }

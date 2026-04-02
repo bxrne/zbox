@@ -36,26 +36,26 @@ fn print_help() void {
 
 /// Parse CLI arguments, load the required JSON config, and return a
 /// populated Args struct.
-pub fn parse(allocator: std.mem.Allocator) !Args {
-    const cli_args = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, cli_args);
+pub fn parse(allocator: std.mem.Allocator, process_args: std.process.Args) Args {
+    var it = std.process.Args.Iterator.init(process_args);
+
+    _ = it.next(); // skip argv[0]
 
     var config_path: ?[]const u8 = null;
     var child_args: [args_max][:0]const u8 = undefined;
     var child_args_count: u32 = 0;
 
-    var i: u32 = 1;
-    while (i < cli_args.len) : (i += 1) {
-        const arg = cli_args[i];
-
+    while (it.next()) |arg| {
         if (std.mem.eql(u8, arg, "--")) {
-            i += 1;
-            while (i < cli_args.len) : (i += 1) {
+            while (it.next()) |child_arg| {
                 if (child_args_count >= args_max) {
                     std.debug.print("error: too many arguments (max {d})\n", .{args_max});
                     std.process.exit(1);
                 }
-                child_args[child_args_count] = try allocator.dupeZ(u8, cli_args[i]);
+                child_args[child_args_count] = allocator.dupeZ(u8, child_arg) catch {
+                    std.debug.print("error: out of memory\n", .{});
+                    std.process.exit(1);
+                };
                 child_args_count += 1;
             }
             break;
@@ -65,12 +65,11 @@ pub fn parse(allocator: std.mem.Allocator) !Args {
             print_help();
             std.process.exit(0);
         } else if (std.mem.eql(u8, arg, "-c") or std.mem.eql(u8, arg, "--config")) {
-            i += 1;
-            if (i >= cli_args.len) {
+            config_path = it.next();
+            if (config_path == null) {
                 std.debug.print("error: {s} requires an argument\n", .{arg});
                 std.process.exit(1);
             }
-            config_path = cli_args[i];
         } else {
             std.debug.print("error: unknown argument: {s}\n", .{arg});
             print_help();
