@@ -1,7 +1,8 @@
 //! Cgroup v2 resource limits for sandboxed processes.
 
 const std = @import("std");
-const fs = std.fs;
+const posix = std.posix;
+const linux = std.os.linux;
 const log = std.log;
 
 pub const CgroupError = error{
@@ -16,11 +17,11 @@ fn write_cgroup_file(dir: []const u8, file: []const u8, data: []const u8) Cgroup
     const path = std.fmt.bufPrintZ(&buf, "/sys/fs/cgroup/{s}/{s}", .{ dir, file }) catch
         return error.WriteFailed;
 
-    var f = fs.openFileAbsolute(path, .{ .mode = .write_only }) catch
+    const fd = posix.openat(posix.AT.FDCWD, path, .{ .ACCMODE = .WRONLY }, 0) catch
         return error.WriteFailed;
-    defer f.close();
+    defer _ = linux.close(fd);
 
-    f.writeAll(data) catch return error.WriteFailed;
+    _ = linux.write(fd, data.ptr, data.len);
 }
 
 /// Create a cgroup v2 group and configure CPU and memory limits.
@@ -38,9 +39,11 @@ pub fn create(name: []const u8, cpu_cores: u32, cpu_limit_percent: u32, memory_l
     const path = std.fmt.bufPrintZ(&path_buf, "/sys/fs/cgroup/{s}", .{name}) catch
         return error.CreateFailed;
 
-    fs.makeDirAbsolute(path) catch |err| {
-        if (err != error.PathAlreadyExists) return error.CreateFailed;
-    };
+    const mkdir_rc: isize = @bitCast(linux.mkdir(path.ptr, 0o755));
+    if (mkdir_rc < 0) {
+        const err = posix.errno(@bitCast(mkdir_rc));
+        if (err != .EXIST) return error.CreateFailed;
+    }
 
     // cpu.max format: "{quota} {period}" — period is 100 000 µs
     const period: u64 = 100_000;
@@ -86,10 +89,11 @@ pub fn destroy(name: []const u8) void {
         return;
     };
 
-    fs.deleteDirAbsolute(path) catch |err| {
-        log.warn("cgroup destroy: failed to remove '{s}': {}", .{ path, err });
+    const rmdir_rc: isize = @bitCast(linux.rmdir(path.ptr));
+    if (rmdir_rc < 0) {
+        log.warn("cgroup destroy: failed to remove '{s}'", .{path});
         return;
-    };
+    }
 
     log.info("cgroup '{s}' destroyed", .{name});
 }
