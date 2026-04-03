@@ -51,9 +51,7 @@ pub fn child_entry(arg: usize) callconv(.c) u8 {
         return 1;
     };
 
-    if (sandbox_ptr.args.config.network_access or sandbox_ptr.args.config.port_forwards.len > 0) {
-        var veth_name_buf: [64]u8 = undefined;
-        const veth_name = std.fmt.bufPrintZ(&veth_name_buf, "zbxs{s}", .{sandbox_ptr.args.config.name}) catch unreachable;
+    if (sandbox_ptr.veth_sandbox) |veth_name| {
         network.configure_sandbox_veth(veth_name) catch |err| {
             log.err("sandbox veth config failed: {}", .{err});
             return 1;
@@ -62,7 +60,7 @@ pub fn child_entry(arg: usize) callconv(.c) u8 {
 
     // Install seccomp filter last — after all privileged setup is done
     // but before execve hands control to untrusted code.
-    seccomp.install() catch |err| {
+    seccomp.install(sandbox_ptr.args.config.network_access) catch |err| {
         log.err("seccomp install failed: {}", .{err});
         return 1;
     };

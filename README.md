@@ -36,15 +36,15 @@ For `network_access` and `port_forwards`:
 zbox uses **seccomp-BPF with a deny list approach** (similar to Docker's default profile):
 
 - **Default action**: Allow all syscalls
-- **Blocked syscalls**: 54 dangerous syscalls are explicitly blocked
+- **Blocked syscalls**: Up to 44 dangerous syscalls are explicitly blocked (29 always, 15 network syscalls conditionally)
 - **Blocked categories**:
   - Kernel module loading (`init_module`, `finit_module`, `delete_module`)
   - Kernel execution (`kexec_load`, `kexec_file_load`)
   - Hardware access (`ioperm`, `iopl`, `syslog`)
   - Memory manipulation (`mbind`, `set_mempolicy`, etc.)
-  - Network operations (blocked since network namespace is isolated)
+  - Network operations (`socket`, `connect`, etc.) — only blocked when `network_access` is disabled; allowed when enabled
   - Device access (`mknod`, `mknodat`)
-  - Privilege escalation (`setuid`, `setgid`, etc.)
+  - Accounting (`acct`)
   - System control (`reboot`, `swapon`, `swapoff`)
   - Debugging (`ptrace`, `process_vm_readv`, etc.)
 
@@ -80,18 +80,18 @@ zig build test
 ## Running
 
 ```bash
-./zig-out/bin/zbox
+./zig-out/bin/zbox --config config.json
 ```
 
 ## Options
 
-- `-c, --cfg <path>` — Path to JSON config file (default: config.json)
+- `-c, --config <path>` — Path to JSON config file (required)
 - `-h, --help` — Show help
 - `--` — Forward remaining arguments to the sandboxed binary
 
 ## Configuration
 
-Configure via JSON file passed with `-c/--cfg`:
+Configure via JSON file passed with `-c/--config`:
 
 | Field | Type | Description |
 |-------|------|-------------|
@@ -143,9 +143,9 @@ When `network_access: true` is set:
 - `iptables` 
 - Root or `CAP_NET_ADMIN` capability for network operations
 
-## Resource Limits (cgroups)
+## Privileged Features (cgroups & networking)
 
-zbox uses Linux cgroups v2 for CPU and memory limits. **This requires sudo** because cgroup files in `/sys/fs/cgroup/` are root-only:
+zbox uses Linux cgroups v2 for CPU and memory limits and veth pairs for networking. **These features require sudo** (or `CAP_NET_ADMIN`) because cgroup files in `/sys/fs/cgroup/` and network device management are root-only:
 
 ```bash
 sudo ./zig-out/bin/zbox -c config.json
@@ -153,9 +153,12 @@ sudo ./zig-out/bin/zbox -c config.json
 
 ### Rootless Mode
 
-Without sudo, the sandbox runs but **resource limits are not applied**. The kernel does not allow unprivileged users to create or manage cgroups. This is a fundamental Linux limitation - all container tools (Docker, Podman, etc.) require root for resource limits.
+Without sudo, the sandbox runs but **resource limits and network features are not applied**:
 
-The sandbox still provides full isolation via namespaces (user, mount, PID, UTS, network), but CPU/memory constraints require privileged access.
+- **cgroups (CPU/memory limits)** — the kernel does not allow unprivileged users to create or manage cgroups. This is a fundamental Linux limitation; all container tools (Docker, Podman, etc.) require root for resource limits.
+- **Network access and port forwarding** — creating veth pairs, configuring IP addresses, and setting up iptables rules all require root or `CAP_NET_ADMIN`. Without privileges, `network_access` and `port_forwards` are silently skipped.
+
+The sandbox still provides full isolation via namespaces (user, mount, PID, UTS, network) and seccomp filtering, but CPU/memory constraints and networking require privileged access.
 
 ## Roadmap
 

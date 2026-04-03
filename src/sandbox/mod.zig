@@ -113,6 +113,15 @@ pub const Sandbox = struct {
     pub fn spawn(self: *Sandbox) !void {
         std.debug.assert(self.pid == 0);
 
+        // Pre-compute veth names before clone so the child's copy of
+        // the Sandbox struct already has them (clone without CLONE.VM
+        // gives the child a separate address space snapshot).
+        if (self.args.config.network_access or self.args.config.port_forwards.len > 0) {
+            const veth = try network.compute_veth_names(self.allocator, self.args.config.name);
+            self.veth_host = veth.host;
+            self.veth_sandbox = veth.sandbox;
+        }
+
         const stack_top = @intFromPtr(self.stack.ptr) + self.stack.len;
         const raw_pid = linux.clone(
             child.child_entry,
@@ -164,26 +173,27 @@ pub const Sandbox = struct {
             self.args.config.memory_limit_mb,
         ) catch |err| {
             log.warn("cgroup setup failed: {}", .{err});
-            return;
         };
         cgroup.add_process(self.args.config.name, self.pid) catch |err| {
             log.warn("cgroup add_process failed: {}", .{err});
         };
 
         if (self.args.config.network_access or self.args.config.port_forwards.len > 0) {
-            try self.setup_network();
+            self.setup_network() catch |err| {
+                log.warn("network setup failed: {}", .{err});
+            };
         }
     }
 
     fn setup_network(self: *Sandbox) !void {
         log.info("setting up network with veth pair", .{});
 
-        const veth = try network.create_veth_pair(self.allocator, self.args.config.name);
-        self.veth_host = veth.host;
-        self.veth_sandbox = veth.sandbox;
+        const host = self.veth_host orelse return error.VethCreationFailed;
+        const sandbox = self.veth_sandbox orelse return error.VethCreationFailed;
 
-        try network.move_veth_to_ns(veth.sandbox, self.pid);
-        try network.configure_host_veth(veth.host);
+        try network.create_veth_link(host, sandbox);
+        try network.move_veth_to_ns(sandbox, self.pid);
+        try network.configure_host_veth(host);
 
         for (self.args.config.port_forwards) |pf| {
             try network.setup_port_forward(pf.host, pf.sandbox);
