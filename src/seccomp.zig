@@ -40,13 +40,13 @@ fn bpf_jump(code: u16, k: u32, jt: u8, jf: u8) sock_filter {
 const OFFSET_NR = 0; // offsetof(seccomp_data, nr)
 const OFFSET_ARCH = 4; // offsetof(seccomp_data, arch)
 
-/// Syscalls the sandboxed process is NOT allowed to make.
+/// Syscalls always blocked regardless of config.
 /// This is a deny list approach: default allow, block specific dangerous syscalls.
 /// Based on container security best practices and Docker's blocked syscalls.
 /// Note: This filter is x86_64-specific (hardcoded syscall numbers and
 /// architecture check). Other architectures require different syscall
 /// numbers and arch identifiers.
-const blocked_syscalls = [_]u32{
+const base_blocked_syscalls = [_]u32{
     // Kernel module loading - prevents loading malicious kernel modules
     @intFromEnum(linux.SYS.init_module),
     @intFromEnum(linux.SYS.finit_module),
@@ -68,46 +68,19 @@ const blocked_syscalls = [_]u32{
     @intFromEnum(linux.SYS.migrate_pages),
     @intFromEnum(linux.SYS.move_pages),
 
-    // Network syscalls - blocked since we use network namespace isolation
-    @intFromEnum(linux.SYS.socket),
-    @intFromEnum(linux.SYS.connect),
-    @intFromEnum(linux.SYS.accept),
-    @intFromEnum(linux.SYS.bind),
-    @intFromEnum(linux.SYS.listen),
-    @intFromEnum(linux.SYS.sendto),
-    @intFromEnum(linux.SYS.recvfrom),
-    @intFromEnum(linux.SYS.sendmsg),
-    @intFromEnum(linux.SYS.recvmsg),
-    @intFromEnum(linux.SYS.accept4),
-    @intFromEnum(linux.SYS.shutdown),
-    @intFromEnum(linux.SYS.getpeername),
-    @intFromEnum(linux.SYS.getsockname),
-    @intFromEnum(linux.SYS.getsockopt),
-    @intFromEnum(linux.SYS.setsockopt),
-
     // Device access - prevents creating device nodes
     @intFromEnum(linux.SYS.mknod),
     @intFromEnum(linux.SYS.mknodat),
 
-    // Privilege escalation - prevents changing privileges
-    @intFromEnum(linux.SYS.setuid),
-    @intFromEnum(linux.SYS.setgid),
-    @intFromEnum(linux.SYS.setreuid),
-    @intFromEnum(linux.SYS.setregid),
-    @intFromEnum(linux.SYS.setresuid),
-    @intFromEnum(linux.SYS.setresgid),
-    @intFromEnum(linux.SYS.setgroups),
+    // Privilege escalation — setuid/setgid family is allowed because
+    // the sandbox runs inside a user namespace which already constrains
+    // UID/GID mappings (same approach as Docker).
     @intFromEnum(linux.SYS.acct),
 
     // System control - prevents system manipulation
     @intFromEnum(linux.SYS.reboot),
     @intFromEnum(linux.SYS.swapon),
     @intFromEnum(linux.SYS.swapoff),
-
-    // Time/Alarm - can be used for timing attacks
-    @intFromEnum(linux.SYS.setitimer),
-    @intFromEnum(linux.SYS.getitimer),
-    @intFromEnum(linux.SYS.alarm),
 
     // Debugging - can be used for information leak
     @intFromEnum(linux.SYS.ptrace),
@@ -124,49 +97,79 @@ const blocked_syscalls = [_]u32{
     @intFromEnum(linux.SYS.add_key),
 };
 
-/// Build the BPF filter program at comptime. The structure is:
+/// Network syscalls — only blocked when network_access is disabled.
+const net_blocked_syscalls = [_]u32{
+    @intFromEnum(linux.SYS.socket),
+    @intFromEnum(linux.SYS.connect),
+    @intFromEnum(linux.SYS.accept),
+    @intFromEnum(linux.SYS.bind),
+    @intFromEnum(linux.SYS.listen),
+    @intFromEnum(linux.SYS.sendto),
+    @intFromEnum(linux.SYS.recvfrom),
+    @intFromEnum(linux.SYS.sendmsg),
+    @intFromEnum(linux.SYS.recvmsg),
+    @intFromEnum(linux.SYS.accept4),
+    @intFromEnum(linux.SYS.shutdown),
+    @intFromEnum(linux.SYS.getpeername),
+    @intFromEnum(linux.SYS.getsockname),
+    @intFromEnum(linux.SYS.getsockopt),
+    @intFromEnum(linux.SYS.setsockopt),
+};
+
+const max_blocked = base_blocked_syscalls.len + net_blocked_syscalls.len;
+const max_filter_len = max_blocked + 5;
+
+/// Build the BPF filter program. The structure is:
 ///   1. Load arch, reject if not x86_64.
 ///   2. Load syscall nr.
 ///   3. For each blocked syscall, jump to KILL if equal.
 ///   4. Default: ALLOW.
-const filter = build_filter();
+fn build_filter(buf: *[max_filter_len]sock_filter, network_access: bool) u16 {
+    var blocked: [max_blocked]u32 = undefined;
+    var n: usize = 0;
 
-fn build_filter() [blocked_syscalls.len + 5]sock_filter {
-    // 3 (load arch + check arch + load nr) + N (jumps) + 1 (allow) + 1 (kill).
-    const n = blocked_syscalls.len;
-    var prog: [n + 5]sock_filter = undefined;
+    for (base_blocked_syscalls) |s| {
+        blocked[n] = s;
+        n += 1;
+    }
+    if (!network_access) {
+        for (net_blocked_syscalls) |s| {
+            blocked[n] = s;
+            n += 1;
+        }
+    }
 
     // [0] Load architecture.
-    prog[0] = bpf_stmt(BPF_LD | BPF_W | BPF_ABS, OFFSET_ARCH);
+    buf[0] = bpf_stmt(BPF_LD | BPF_W | BPF_ABS, OFFSET_ARCH);
     // [1] If arch != x86_64, jump to kill (skip n+1 instructions).
     // AUDIT_ARCH_X86_64 = 64BIT | LE | EM_X86_64 = 0xC000003E.
-    prog[1] = bpf_jump(
+    buf[1] = bpf_jump(
         BPF_JMP | BPF_JEQ | BPF_K,
         0xC000003E,
         0, // jt: continue to [2]
         @intCast(n + 1), // jf: jump to kill (wrong architecture)
     );
     // [2] Load syscall number.
-    prog[2] = bpf_stmt(BPF_LD | BPF_W | BPF_ABS, OFFSET_NR);
+    buf[2] = bpf_stmt(BPF_LD | BPF_W | BPF_ABS, OFFSET_NR);
 
     // [3..3+n-1] One conditional jump per blocked syscall.
     for (0..n) |i| {
         // Distance to the KILL instruction from this instruction.
         const dist_to_kill: u8 = @intCast(n - i);
-        prog[3 + i] = bpf_jump(
+        buf[3 + i] = bpf_jump(
             BPF_JMP | BPF_JEQ | BPF_K,
-            blocked_syscalls[i],
+            blocked[i],
             dist_to_kill, // jt: jump to kill
             0, // jf: continue checking
         );
     }
 
     // [3+n] Default: allow the syscall (if not blocked).
-    prog[3 + n] = bpf_stmt(BPF_RET | BPF_K, SECCOMP.RET.ALLOW);
+    buf[3 + n] = bpf_stmt(BPF_RET | BPF_K, SECCOMP.RET.ALLOW);
     // [3+n+1] Kill (for blocked syscalls or wrong architecture).
-    prog[3 + n + 1] = bpf_stmt(BPF_RET | BPF_K, SECCOMP.RET.KILL_PROCESS);
+    buf[3 + n + 1] = bpf_stmt(BPF_RET | BPF_K, SECCOMP.RET.KILL_PROCESS);
 
-    return prog;
+    return @intCast(n + 5);
 }
 
 pub const SeccompError = error{
@@ -176,7 +179,8 @@ pub const SeccompError = error{
 
 /// Install the seccomp filter. Must be called after all privileged
 /// setup (mounts, chroot, loopback) but before execve.
-pub fn install() SeccompError!void {
+/// When `network_access` is true, socket/networking syscalls are allowed.
+pub fn install(network_access: bool) SeccompError!void {
     const PR_SET_NO_NEW_PRIVS = 38;
 
     // seccomp requires NO_NEW_PRIVS to be set first.
@@ -189,9 +193,12 @@ pub fn install() SeccompError!void {
     ));
     if (nnp_rc != 0) return error.SetNoNewPrivsFailed;
 
+    var filter_buf: [max_filter_len]sock_filter = undefined;
+    const filter_len = build_filter(&filter_buf, network_access);
+
     const prog = sock_fprog{
-        .len = filter.len,
-        .filter = &filter,
+        .len = filter_len,
+        .filter = &filter_buf,
     };
 
     const rc: isize = @bitCast(linux.syscall3(
@@ -202,39 +209,47 @@ pub fn install() SeccompError!void {
     ));
     if (rc < 0) return error.SeccompLoadFailed;
 
-    log.info("seccomp deny list filter installed ({d} dangerous syscalls blocked)", .{blocked_syscalls.len});
+    const blocked_count = filter_len - 5;
+    log.info("seccomp deny list filter installed ({d} dangerous syscalls blocked)", .{blocked_count});
 }
 
-test "filter is built at comptime" {
-    // Verify the filter has the expected length.
-    const expected_len = blocked_syscalls.len + 5;
-    try std.testing.expectEqual(expected_len, filter.len);
+test "filter — network blocked when disabled" {
+    var buf: [max_filter_len]sock_filter = undefined;
+    const len = build_filter(&buf, false);
+    const expected_len: u16 = @intCast(base_blocked_syscalls.len + net_blocked_syscalls.len + 5);
+    try std.testing.expectEqual(expected_len, len);
 
     // First instruction loads arch.
-    try std.testing.expectEqual(BPF_LD | BPF_W | BPF_ABS, filter[0].code);
-    try std.testing.expectEqual(OFFSET_ARCH, filter[0].k);
+    try std.testing.expectEqual(BPF_LD | BPF_W | BPF_ABS, buf[0].code);
+    try std.testing.expectEqual(OFFSET_ARCH, buf[0].k);
 
-    // Second checks x86_64 (AUDIT_ARCH_X86_64 = 0xC000003E).
-    try std.testing.expectEqual(@as(u32, 0xC000003E), filter[1].k);
+    // Second checks x86_64.
+    try std.testing.expectEqual(@as(u32, 0xC000003E), buf[1].k);
 
-    // Last instruction is KILL_PROCESS (for blocked syscalls).
-    try std.testing.expectEqual(SECCOMP.RET.KILL_PROCESS, filter[filter.len - 1].k);
+    // Last instruction is KILL_PROCESS.
+    try std.testing.expectEqual(SECCOMP.RET.KILL_PROCESS, buf[len - 1].k);
 
-    // Second-to-last is ALLOW (default action).
-    try std.testing.expectEqual(SECCOMP.RET.ALLOW, filter[filter.len - 2].k);
+    // Second-to-last is ALLOW.
+    try std.testing.expectEqual(SECCOMP.RET.ALLOW, buf[len - 2].k);
 }
 
-test "blocked_syscalls contains dangerous syscalls" {
+test "filter — network allowed when enabled" {
+    var buf: [max_filter_len]sock_filter = undefined;
+    const len = build_filter(&buf, true);
+    const expected_len: u16 = @intCast(base_blocked_syscalls.len + 5);
+    try std.testing.expectEqual(expected_len, len);
+}
+
+test "base_blocked_syscalls contains dangerous syscalls" {
     const dangerous = [_]u32{
         @intFromEnum(linux.SYS.init_module),
         @intFromEnum(linux.SYS.kexec_load),
-        @intFromEnum(linux.SYS.socket),
         @intFromEnum(linux.SYS.ptrace),
         @intFromEnum(linux.SYS.reboot),
     };
     for (dangerous) |nr| {
         var found = false;
-        for (blocked_syscalls) |b| {
+        for (base_blocked_syscalls) |b| {
             if (b == nr) {
                 found = true;
                 break;
@@ -244,8 +259,18 @@ test "blocked_syscalls contains dangerous syscalls" {
     }
 }
 
+test "net_blocked_syscalls contains socket" {
+    var found = false;
+    for (net_blocked_syscalls) |b| {
+        if (b == @intFromEnum(linux.SYS.socket)) {
+            found = true;
+            break;
+        }
+    }
+    try std.testing.expect(found);
+}
+
 test "essential syscalls are not blocked" {
-    // These syscalls should NOT be in the blocked list
     const essentials = [_]u32{
         @intFromEnum(linux.SYS.read),
         @intFromEnum(linux.SYS.write),
@@ -255,7 +280,7 @@ test "essential syscalls are not blocked" {
         @intFromEnum(linux.SYS.openat),
     };
     for (essentials) |nr| {
-        for (blocked_syscalls) |b| {
+        for (base_blocked_syscalls) |b| {
             try std.testing.expect(nr != b);
         }
     }

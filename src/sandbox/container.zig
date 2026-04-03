@@ -28,6 +28,13 @@ pub fn setup_container_fs(root: [:0]const u8, binary: [:0]const u8) !void {
     ) catch unreachable;
     try copyFile(binary, bin_dst);
 
+    // Provide an `ip` applet when using busybox.
+    if (std.mem.eql(u8, basename, "busybox")) {
+        var link_buf: [4096]u8 = undefined;
+        const ip_link = std.fmt.bufPrintZ(&link_buf, "{s}/bin/ip", .{root}) catch unreachable;
+        fs.create_symlink("/bin/busybox", ip_link) catch {};
+    }
+
     copy_host_configs(root);
     log.info("containerfs setup complete", .{});
 }
