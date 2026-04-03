@@ -14,7 +14,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: mlugg/setup-zig@v2
         with:
-          version: 0.15.2
+          version: 0.16.0-dev.3028+a85495ca2
       - run: sudo apt-get install -y busybox-static
       - run: zig build
       - run: zig build test
